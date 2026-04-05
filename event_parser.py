@@ -2,10 +2,19 @@ import requests
 from bs4 import BeautifulSoup
 import dateparser
 import re
-from datetime import datetime
-from typing import List, Dict, Optional
+import json
+import logging
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Any, Iterable
 from config import EVENT_KEYWORDS, CLASSIFIER_CONFIDENCE_THRESHOLD
 from event_classifier import EventClassifier
+
+logger = logging.getLogger(__name__)
+
+HTML_EVENT_CLASS_HINTS = [
+    'event', 'events', 'meetup', 'conference', 'webinar', 'seminar',
+    'workshop', 'hackathon', 'startup', 'entrepreneur', 'pitch', 'networking'
+]
 
 
 class EventParser:
@@ -24,13 +33,13 @@ class EventParser:
         
         try:
             if resource_type == 'channel':
-                # For Telegram channels, we'd need to use Telegram API
-                # This is a placeholder - actual implementation would use Telethon or similar
-                pass
+                events = self._parse_telegram_channel(resource_url)
             elif resource_type in ['blog', 'website']:
                 events = self._parse_website(resource_url)
+            else:
+                logger.warning(f"Unknown resource type: {resource_type}")
         except Exception as e:
-            print(f"Error parsing resource {resource_url}: {e}")
+            logger.error(f"Error parsing resource {resource_url}: {e}", exc_info=True)
         
         return events
     
@@ -39,36 +48,20 @@ class EventParser:
         events = []
         
         try:
+            logger.info(f"Parsing website: {url}")
             response = self.session.get(url, timeout=10)
             response.raise_for_status()
             
             soup = BeautifulSoup(response.content, 'lxml')
             
-            # Look for event-related content
-            # This is a simplified parser - can be enhanced based on specific site structures
-            text_content = soup.get_text().lower()
-            
-            # Check if page contains event keywords
-            has_event_keywords = any(keyword in text_content for keyword in EVENT_KEYWORDS)
-            
-            if has_event_keywords:
-                # Try to extract event information
-                # Look for common patterns: dates, titles, descriptions
-                event_data = self._extract_event_info(soup, url)
-                if event_data:
-                    # Classify event using neural network
-                    is_relevant, confidence = self.classifier.is_relevant_event(
-                        event_data['title'],
-                        event_data.get('description', '')
-                    )
-                    
-                    if is_relevant and confidence >= CLASSIFIER_CONFIDENCE_THRESHOLD:
-                        events.append(event_data)
-                    else:
-                        print(f"Event filtered out: {event_data['title']} (confidence: {confidence:.2f})")
+            # Extract events from JSON-LD and HTML tags
+            # Both methods will add events directly via _evaluate_candidate
+            self._extract_events_from_json_ld(soup, url, events)
+            self._extract_events_from_tags(soup, url, events)
         except Exception as e:
-            print(f"Error parsing website {url}: {e}")
+            logger.error(f"Error parsing website {url}: {e}", exc_info=True)
         
+        logger.info(f"Found {len(events)} events from {url}")
         return events
     
     def _extract_event_info(self, soup: BeautifulSoup, source_url: str) -> Optional[Dict]:
@@ -121,32 +114,50 @@ class EventParser:
     
     def _extract_date(self, soup: BeautifulSoup) -> Optional[datetime]:
         """Extract event date from HTML"""
-        # Look for common date patterns
         text = soup.get_text()
+        date = self._extract_date_from_text(text)
+        if date:
+            return date
         
-        # Try to find dates in various formats
-        date_patterns = [
-            r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}',  # DD/MM/YYYY or DD-MM-YYYY
-            r'\d{4}[/-]\d{1,2}[/-]\d{1,2}',   # YYYY/MM/DD
-            r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}',
-            r'\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}',
-        ]
-        
-        for pattern in date_patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            for match in matches:
-                parsed_date = dateparser.parse(match)
-                if parsed_date and parsed_date > datetime.now():
-                    return parsed_date
-        
-        # Try to find in meta tags
+        # Fallback to meta tags
         meta_date = soup.find('meta', property='event:start_time')
         if meta_date:
             date_str = meta_date.get('content', '')
-            parsed_date = dateparser.parse(date_str)
-            if parsed_date:
+            parsed_date = dateparser.parse(date_str, languages=['ru', 'en'])
+            if parsed_date and parsed_date > datetime.now():
                 return parsed_date
         
+        return None
+    
+    def _extract_date_from_text(self, text: str) -> Optional[datetime]:
+        """Extract event date from text snippet"""
+        RU_MONTHS = r'(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)'
+        EN_MONTHS = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*'
+        TIME_OPT = r'(?:\s+\d{1,2}:\d{2})?'
+
+        date_patterns = [
+            r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}',                          # DD/MM/YYYY
+            r'\d{4}[/-]\d{1,2}[/-]\d{1,2}',                            # YYYY/MM/DD
+            rf'{EN_MONTHS}\s+\d{{1,2}},?\s+\d{{4}}',                   # Jan 8, 2026
+            rf'\d{{1,2}}\s+{EN_MONTHS}\s+\d{{4}}',                     # 8 Jan 2026
+            rf'\d{{1,2}}\s+{RU_MONTHS}\s+\d{{4}}{TIME_OPT}',           # 8 апреля 2026 10:00
+            rf'{RU_MONTHS}\s+\d{{1,2}},?\s+\d{{4}}',                   # апреля 8, 2026
+            rf'\d{{1,2}}[-–]\d{{1,2}}\s+{RU_MONTHS}{TIME_OPT}',        # 8-9 апреля
+            rf'\d{{1,2}}\s+{RU_MONTHS}{TIME_OPT}',                     # 8 апреля 10:00 (no year)
+            rf'\d{{1,2}}\s+{EN_MONTHS}{TIME_OPT}',                     # 8 April 10:00 (no year)
+        ]
+
+        for pattern in date_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                parsed_date = dateparser.parse(
+                    match,
+                    languages=['ru', 'en'],
+                    settings={'PREFER_DAY_OF_MONTH': 'first', 'PREFER_DATES_FROM': 'future'},
+                )
+                if parsed_date and parsed_date > datetime.now():
+                    return parsed_date
+
         return None
     
     def _extract_location(self, soup: BeautifulSoup) -> Optional[str]:
@@ -171,11 +182,199 @@ class EventParser:
         return None
     
     def parse_telegram_channel(self, channel_username: str) -> List[Dict]:
-        """Parse events from a Telegram channel
-        Note: This requires Telegram API access (Telethon or similar)
-        This is a placeholder - actual implementation would fetch channel posts
-        """
-        # TODO: Implement Telegram channel parsing using Telethon
-        # For now, return empty list
-        return []
+        """Backward compatibility wrapper."""
+        return self._parse_telegram_channel(channel_username)
+    
+    def _extract_events_from_json_ld(self, soup: BeautifulSoup, source_url: str, events: List[Dict]):
+        """Extract events from JSON-LD structured data and add them via _evaluate_candidate"""
+        scripts = soup.find_all('script', type='application/ld+json')
+        
+        for script in scripts:
+            try:
+                if not script.string:
+                    continue
+                data = json.loads(script.string)
+                for item in self._iter_json_ld(data):
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = item.get('@type')
+                    if isinstance(item_type, list):
+                        is_event = any('event' in str(t).lower() for t in item_type)
+                    else:
+                        is_event = item_type and 'event' in str(item_type).lower()
+                    
+                    if not is_event:
+                        continue
+                    
+                    title = item.get('name') or item.get('headline')
+                    description = item.get('description') or ''
+                    start_date = item.get('startDate')
+                    location = ''
+                    location_data = item.get('location')
+                    if isinstance(location_data, dict):
+                        location = location_data.get('name') or location_data.get('address', '')
+                    
+                    event_date = None
+                    if start_date:
+                        event_date = dateparser.parse(start_date, languages=['ru', 'en'])
+                    
+                    if title and event_date:
+                        candidate = {
+                            'title': title.strip(),
+                            'description': description.strip()[:500],
+                            'event_date': event_date,
+                            'location': location.strip(),
+                            'url': item.get('url') or source_url
+                        }
+                        self._evaluate_candidate(candidate, events)
+            except json.JSONDecodeError:
+                continue
+            except Exception as e:
+                logger.debug(f"Error parsing JSON-LD on {source_url}: {e}")
+    
+    def _iter_json_ld(self, data: Any) -> Iterable[Any]:
+        if isinstance(data, list):
+            for item in data:
+                yield from self._iter_json_ld(item)
+        elif isinstance(data, dict):
+            yield data
+            for value in data.values():
+                yield from self._iter_json_ld(value)
+    
+    def _extract_events_from_tags(self, soup: BeautifulSoup, source_url: str, events: List[Dict]):
+        """Extract events from HTML tags and add them via _evaluate_candidate"""
+        selectors = ['article', 'section', 'div', 'li']
+        for selector in selectors:
+            for element in soup.select(selector):
+                classes = ' '.join(element.get('class', [])).lower()
+                if any(hint in classes for hint in HTML_EVENT_CLASS_HINTS):
+                    candidate = self._extract_event_from_element(element, source_url)
+                    if candidate:
+                        self._evaluate_candidate(candidate, events)
+    
+    def _extract_event_from_element(self, element, source_url: str) -> Optional[Dict]:
+        title = None
+        for tag in ['h1', 'h2', 'h3', 'a']:
+            elem = element.find(tag)
+            if elem and elem.get_text().strip():
+                title = elem.get_text().strip()
+                break
+        
+        if not title:
+            return None
+        
+        description = ''
+        paragraphs = element.find_all('p')
+        if paragraphs:
+            description = ' '.join(p.get_text().strip() for p in paragraphs[:3])[:500]
+        else:
+            description = element.get_text().strip()[:500]
+        
+        date_text = element.get_text(separator=' ')
+        event_date = self._extract_date_from_text(date_text)
+        if not event_date:
+            return None
+        
+        location = None
+        location_elem = element.find(string=re.compile(r'(?:Место|Location|Venue)', re.IGNORECASE))
+        if location_elem:
+            location = location_elem.parent.get_text().split(':', 1)[-1].strip()
+        
+        url = source_url
+        link = element.find('a', href=True)
+        if link and link['href'].startswith('http'):
+            url = link['href']
+        
+        return {
+            'title': title,
+            'description': description,
+            'event_date': event_date,
+            'location': location,
+            'url': url
+        }
+    
+    def _is_upcoming_event(self, event_date: datetime) -> bool:
+        """Check if event date is in the future within a 90-day window"""
+        now = datetime.now()
+        return now <= event_date <= now + timedelta(days=90)
+    
+    def _evaluate_candidate(self, candidate: Dict, events: List[Dict]):
+        if not candidate.get('title') or not candidate.get('event_date'):
+            return
+        
+        event_date = candidate['event_date']
+        
+        # Check if event is upcoming (within 90 days)
+        if not self._is_upcoming_event(event_date):
+            logger.debug(
+                f"Event '{candidate['title']}' rejected: "
+                f"date {event_date.strftime('%Y-%m-%d')} is not within 90-day window"
+            )
+            return
+        
+        is_relevant, confidence = self.classifier.is_relevant_event(
+            candidate['title'],
+            candidate.get('description', '')
+        )
+        
+        logger.info(
+            f"Classification result for '{candidate['title']}': "
+            f"relevant={is_relevant}, confidence={confidence:.2f}, "
+            f"threshold={CLASSIFIER_CONFIDENCE_THRESHOLD}, "
+            f"date={event_date.strftime('%Y-%m-%d')}"
+        )
+        
+        if is_relevant and confidence >= CLASSIFIER_CONFIDENCE_THRESHOLD:
+            events.append(candidate)
+            logger.info(f"Event accepted: {candidate['title']} on {event_date.strftime('%Y-%m-%d')}")
+        else:
+            logger.debug(f"Event rejected: {candidate['title']} (classification failed)")
+    
+    def _parse_telegram_channel(self, channel_url: str) -> List[Dict]:
+        """Parse Telegram channel via public web view using keywords."""
+        logger.info(f"Parsing Telegram channel: {channel_url}")
+        events = []
+        
+        if channel_url.startswith('https://t.me/') or channel_url.startswith('http://t.me/'):
+            fetch_url = channel_url if '/s/' in channel_url else channel_url.replace('t.me', 't.me/s', 1)
+        else:
+            fetch_url = f"https://t.me/s/{channel_url.lstrip('@')}"
+        
+        try:
+            response = self.session.get(fetch_url, timeout=10)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'lxml')
+            
+            messages = soup.select('.tgme_widget_message')
+            logger.debug(f"Found {len(messages)} messages on channel page")
+            
+            for msg in messages:
+                text = msg.get_text(separator=' ').strip()
+                text_lower = text.lower()
+                
+                if not any(keyword in text_lower for keyword in EVENT_KEYWORDS):
+                    continue
+                
+                event_date = self._extract_date_from_text(text)
+                if not event_date:
+                    continue
+                
+                title = text.split('\n')[0][:120]
+                link_elem = msg.select_one('a.tgme_widget_message_date')
+                url = link_elem['href'] if link_elem and link_elem.has_attr('href') else fetch_url
+                
+                candidate = {
+                    'title': title,
+                    'description': text[:500],
+                    'event_date': event_date,
+                    'location': None,
+                    'url': url
+                }
+                
+                self._evaluate_candidate(candidate, events)
+        except Exception as e:
+            logger.error(f"Error parsing Telegram channel {channel_url}: {e}", exc_info=True)
+        
+        logger.info(f"Found {len(events)} events from Telegram channel {channel_url}")
+        return events
 

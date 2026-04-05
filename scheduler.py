@@ -1,43 +1,49 @@
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger
 from datetime import datetime, timedelta
 from database import Database
 from telegram import Bot
-from config import BOT_TOKEN, CHECK_INTERVAL_MINUTES
-import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class ReminderScheduler:
     """Handle scheduled reminders for events"""
     
-    def __init__(self, bot: Bot, db: Database):
+    def __init__(self, bot: Bot, db: Database, job_queue):
         self.bot = bot
         self.db = db
-        self.scheduler = AsyncIOScheduler()
+        self.job_queue = job_queue
     
     def start(self):
-        """Start the scheduler"""
+        """Start the scheduler using job_queue"""
         # Check for 1-day reminders every hour
-        self.scheduler.add_job(
-            self.send_1day_reminders,
-            trigger=IntervalTrigger(hours=1),
-            id='1day_reminders',
-            replace_existing=True
+        self.job_queue.run_repeating(
+            self._send_1day_reminders_wrapper,
+            interval=3600,  # 1 hour in seconds
+            first=60  # Start after 1 minute
         )
         
         # Check for 1-hour reminders every 15 minutes
-        self.scheduler.add_job(
-            self.send_1hour_reminders,
-            trigger=IntervalTrigger(minutes=15),
-            id='1hour_reminders',
-            replace_existing=True
+        self.job_queue.run_repeating(
+            self._send_1hour_reminders_wrapper,
+            interval=900,  # 15 minutes in seconds
+            first=60  # Start after 1 minute
         )
         
-        self.scheduler.start()
+        logger.info("Reminder scheduler started")
+    
+    async def _send_1day_reminders_wrapper(self, context):
+        """Wrapper for send_1day_reminders to work with job_queue"""
+        await self.send_1day_reminders()
+    
+    async def _send_1hour_reminders_wrapper(self, context):
+        """Wrapper for send_1hour_reminders to work with job_queue"""
+        await self.send_1hour_reminders()
     
     def stop(self):
         """Stop the scheduler"""
-        self.scheduler.shutdown()
+        # Job queue will be stopped automatically when application stops
+        pass
     
     async def send_1day_reminders(self):
         """Send reminders 1 day before events"""
@@ -67,7 +73,7 @@ class ReminderScheduler:
                 
                 self.db.mark_reminder_sent(registration.id, '1day')
             except Exception as e:
-                print(f"Error sending 1-day reminder: {e}")
+                logger.error(f"Error sending 1-day reminder: {e}")
     
     async def send_1hour_reminders(self):
         """Send reminders 1 hour before events"""
@@ -97,5 +103,5 @@ class ReminderScheduler:
                 
                 self.db.mark_reminder_sent(registration.id, '1hour')
             except Exception as e:
-                print(f"Error sending 1-hour reminder: {e}")
+                logger.error(f"Error sending 1-hour reminder: {e}")
 

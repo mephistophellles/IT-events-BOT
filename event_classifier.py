@@ -1,51 +1,96 @@
 import os
 import logging
-import requests
-from typing import Dict, Optional, Tuple
-from config import USE_OLLAMA_CLASSIFIER, OLLAMA_BASE_URL, OLLAMA_MODEL, CLASSIFIER_CONFIDENCE_THRESHOLD
+import json
+import re
+from typing import Optional, Tuple
+from config import (
+    USE_GEMINI_CLASSIFIER,
+    GEMINI_API_KEY,
+    GEMINI_MODEL,
+    CLASSIFIER_CONFIDENCE_THRESHOLD,
+    USE_CLAUDE_CLASSIFIER,
+    ANTHROPIC_API_KEY,
+    CLAUDE_MODEL,
+)
 
 logger = logging.getLogger(__name__)
 
 
+def _build_classification_prompt(text: str) -> str:
+    """Build the shared classification prompt for LLM classifiers."""
+    return """Ты эксперт по определению релевантности событий для предпринимателей и стартапов.
+
+ОСОБЕННО релевантно (наивысший приоритет):
+- Встречи с инвесторами / investor meetings
+- Питч-сессии / pitch sessions, Demo Day
+- Венчурное финансирование, раунды инвестиций
+- Акселераторы, инкубаторы (набор и мероприятия)
+
+Также релевантно:
+- Стартапы и предпринимательство
+- Бизнес-конференции и митапы для бизнеса
+- Технологии для бизнеса (SaaS, B2B)
+- Нетворкинг для предпринимателей
+
+НЕ релевантно:
+- Дизайн (UI/UX, графический дизайн) без бизнес-контекста
+- Искусство, творчество, личные хобби
+- HR-конференции, госзакупки, медицина
+- События для других профессиональных групп без связи с предпринимательством
+
+Текст события:
+{}
+
+Ответь строго в формате JSON: {{"relevant": true/false, "confidence": 0.0-1.0, "reason": "..."}}""".format(text)
+
+
 class EventClassifier:
-    """Neural network-based classifier to determine if an event is relevant for entrepreneurs/startups"""
-    
+    """Classifier to determine if an event is relevant for entrepreneurs/startups.
+
+    Priority order:
+    1. Claude API (if USE_CLAUDE_CLASSIFIER=true and ANTHROPIC_API_KEY set)
+    2. Gemini API (if USE_GEMINI_CLASSIFIER=true and GEMINI_API_KEY set)
+    3. BART zero-shot (local model, ~1.5GB)
+    4. Keyword-based fallback
+    """
+
     def __init__(self):
-        self.use_ollama = USE_OLLAMA_CLASSIFIER
-        self.ollama_base_url = OLLAMA_BASE_URL
-        self.ollama_model = OLLAMA_MODEL
         self.confidence_threshold = CLASSIFIER_CONFIDENCE_THRESHOLD
-        
-        if self.use_ollama:
-            # Test Ollama connection
-            if self._test_ollama_connection():
-                logger.info(f"Using Ollama ({self.ollama_model}) for event classification")
-            else:
-                logger.warning("Ollama connection failed, falling back to local model")
-                self.use_ollama = False
-        
-        if not self.use_ollama:
-            self._init_local_model()
-    
-    def _test_ollama_connection(self) -> bool:
-        """Test if Ollama is available"""
-        try:
-            response = requests.get(f"{self.ollama_base_url}/api/tags", timeout=5)
-            return response.status_code == 200
-        except Exception as e:
-            logger.debug(f"Ollama connection test failed: {e}")
-            return False
-    
-    def _init_local_model(self):
-        """Initialize local transformer model for classification"""
+        self.claude_client = None
+        self.gemini_model = None
+        self.bart_classifier = None
+
+        # Try Claude first
+        if USE_CLAUDE_CLASSIFIER and ANTHROPIC_API_KEY:
+            try:
+                import anthropic
+                self.claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+                logger.info(f"Using Claude model '{CLAUDE_MODEL}' for event classification")
+            except Exception as e:
+                logger.warning(f"Could not initialize Claude client: {e}")
+
+        # Try Gemini if Claude not available
+        if not self.claude_client and USE_GEMINI_CLASSIFIER and GEMINI_API_KEY:
+            try:
+                import google.generativeai as genai  # type: ignore
+                genai.configure(api_key=GEMINI_API_KEY)
+                self.gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+                logger.info(f"Using Gemini model '{GEMINI_MODEL}' for event classification")
+            except Exception as e:
+                logger.warning(f"Could not initialize Gemini model: {e}, falling back to local model")
+
+        # Load BART if no LLM API available
+        if not self.claude_client and not self.gemini_model:
+            self._init_bart()
+
+    def _init_bart(self):
+        """Initialize local BART model for zero-shot classification."""
         try:
             from transformers import pipeline
             import torch
-            
-            # Use zero-shot classification - works with multiple languages including Russian
-            # BART-large-mnli is multilingual and can handle Russian text
+
             try:
-                self.classifier = pipeline(
+                self.bart_classifier = pipeline(
                     "zero-shot-classification",
                     model="facebook/bart-large-mnli",
                     device=0 if torch.cuda.is_available() else -1
@@ -53,113 +98,78 @@ class EventClassifier:
                 logger.info("Using BART zero-shot classifier for event classification")
             except Exception as e:
                 logger.warning(f"Could not load BART model: {e}, using keyword-based fallback")
-                self.classifier = None
-                
         except ImportError:
             logger.warning("Transformers library not found, using keyword-based classification")
-            self.classifier = None
-        except Exception as e:
-            logger.error(f"Error initializing local model: {e}")
-            self.classifier = None
-    
+
     def is_relevant_event(self, title: str, description: str = "") -> Tuple[bool, float]:
-        """
-        Determine if an event is relevant for entrepreneurs/startups
-        
+        """Determine if an event is relevant for entrepreneurs/startups.
+
         Returns:
             (is_relevant, confidence_score)
         """
         if not title:
             return False, 0.0
-        
-        # Combine title and description for analysis
-        text = f"{title}. {description}"[:1000]  # Limit text length
-        
-        if self.use_ollama:
-            return self._classify_with_ollama(text)
-        elif self.classifier:
-            return self._classify_with_local_model(text)
+
+        text = f"{title}. {description}"[:1000]
+
+        if self.claude_client:
+            return self._classify_with_claude(text)
+        elif self.gemini_model:
+            return self._classify_with_gemini(text)
+        elif self.bart_classifier:
+            return self._classify_with_bart(text)
         else:
-            # Fallback to keyword-based classification
             return self._classify_with_keywords(text)
-    
-    def _classify_with_ollama(self, text: str) -> Tuple[bool, float]:
-        """Classify event using Ollama"""
+
+    def _classify_with_claude(self, text: str) -> Tuple[bool, float]:
+        """Classify event using Claude API."""
         try:
-            prompt = """Определи, относится ли это событие к предпринимательству, стартапам, бизнесу или технологиям для бизнеса.
-
-Событие релевантно, если оно связано с:
-- Стартапами и предпринимательством
-- Бизнес-конференциями и митапами для бизнеса
-- Технологиями для бизнеса (SaaS, B2B)
-- Инвестициями и венчурным капиталом
-- Бизнес-акселераторами и инкубаторами
-- Питчами стартапов
-- Нетворкингом для предпринимателей
-
-Событие НЕ релевантно, если оно связано с:
-- Дизайном (UI/UX, графический дизайн) без бизнес-контекста
-- Искусством и творчеством
-- Личными хобби
-- Событиями для других профессиональных групп (врачи, учителя и т.д.)
-
-Текст события:
-{}
-
-Ответь только "ДА" или "НЕТ", затем через пробел укажи уверенность от 0.0 до 1.0.""".format(text)
-            
-            response = requests.post(
-                f"{self.ollama_base_url}/api/generate",
-                json={
-                    "model": self.ollama_model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.3,
-                        "num_predict": 50
-                    }
-                },
-                timeout=30
+            prompt = _build_classification_prompt(text)
+            message = self.claude_client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=256,
+                messages=[{"role": "user", "content": prompt}]
             )
-            
-            if response.status_code != 200:
-                logger.error(f"Ollama API error: {response.status_code}")
+            raw_text = message.content[0].text.strip() if message.content else ""
+            logger.debug(f"Claude raw response: {raw_text}")
+
+            json_text = self._extract_json(raw_text)
+            if not json_text:
+                logger.warning("Claude response did not contain JSON, falling back to keywords")
                 return self._classify_with_keywords(text)
-            
-            result_data = response.json()
-            result = result_data.get('response', '').strip().upper()
-            
-            if result.startswith("ДА"):
-                confidence = 0.9
-                try:
-                    # Try to extract confidence from response
-                    parts = result.split()
-                    if len(parts) > 1:
-                        confidence = float(parts[-1])
-                except:
-                    pass
-                return True, confidence
-            else:
-                confidence = 0.1
-                try:
-                    parts = result.split()
-                    if len(parts) > 1:
-                        confidence = float(parts[-1])
-                except:
-                    pass
-                return False, confidence
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error connecting to Ollama: {e}")
-            return self._classify_with_keywords(text)
+
+            data = json.loads(json_text)
+            is_relevant = bool(data.get("relevant"))
+            confidence = float(data.get("confidence", 0.5))
+            return is_relevant, confidence
         except Exception as e:
-            logger.error(f"Error classifying with Ollama: {e}")
+            logger.error(f"Error classifying with Claude: {e}", exc_info=True)
             return self._classify_with_keywords(text)
-    
-    def _classify_with_local_model(self, text: str) -> Tuple[bool, float]:
-        """Classify event using local transformer model"""
+
+    def _classify_with_gemini(self, text: str) -> Tuple[bool, float]:
+        """Classify event using Gemini."""
         try:
-            # Zero-shot classification labels
+            prompt = _build_classification_prompt(text)
+            response = self.gemini_model.generate_content(prompt)
+            raw_text = (response.text or "").strip()
+            logger.debug(f"Gemini raw response: {raw_text}")
+
+            json_text = self._extract_json(raw_text)
+            if not json_text:
+                logger.warning("Gemini response did not contain JSON, falling back to keywords")
+                return self._classify_with_keywords(text)
+
+            data = json.loads(json_text)
+            is_relevant = bool(data.get("relevant"))
+            confidence = float(data.get("confidence", 0.5))
+            return is_relevant, confidence
+        except Exception as e:
+            logger.error(f"Error classifying with Gemini: {e}", exc_info=True)
+            return self._classify_with_keywords(text)
+
+    def _classify_with_bart(self, text: str) -> Tuple[bool, float]:
+        """Classify event using local BART zero-shot model."""
+        try:
             candidate_labels = [
                 "событие для предпринимателей и стартапов",
                 "бизнес-конференция или митап",
@@ -167,56 +177,87 @@ class EventClassifier:
                 "событие для других профессий",
                 "общее мероприятие"
             ]
-            
-            result = self.classifier(text, candidate_labels)
-            
-            # Get the most likely label and its score
+
+            result = self.bart_classifier(text, candidate_labels)
             top_label = result['labels'][0]
             top_score = result['scores'][0]
-            
-            # Check if it's relevant (first two labels are relevant)
+
+            logger.debug(f"BART classification: label={top_label}, score={top_score:.2f}")
+
             is_relevant = top_label in candidate_labels[:2]
-            
-            # Adjust confidence based on score
             confidence = top_score if is_relevant else (1.0 - top_score)
-            
+
+            if not is_relevant and top_score > 0.3:
+                for i, label in enumerate(candidate_labels[:2]):
+                    if result['scores'][i] > 0.25:
+                        is_relevant = True
+                        confidence = result['scores'][i]
+                        logger.debug(f"Overriding classification based on secondary label: {label}")
+                        break
+
             return is_relevant, confidence
-            
         except Exception as e:
-            logger.error(f"Error classifying with local model: {e}")
+            logger.error(f"Error classifying with BART: {e}", exc_info=True)
             return self._classify_with_keywords(text)
-    
+
     def _classify_with_keywords(self, text: str) -> Tuple[bool, float]:
-        """Fallback keyword-based classification"""
+        """Fallback keyword-based classification."""
         text_lower = text.lower()
-        
-        # Positive keywords (entrepreneurship/startup related)
+
         positive_keywords = [
             'стартап', 'startup', 'предприниматель', 'entrepreneur', 'бизнес', 'business',
             'инвестиции', 'investment', 'венчур', 'venture', 'акселератор', 'accelerator',
             'инкубатор', 'incubator', 'питч', 'pitch', 'демо-день', 'demo day',
-            'нетворкинг', 'networking', 'saas', 'b2b', 'технологии для бизнеса',
-            'бизнес-конференция', 'бизнес-митап', 'entrepreneurship'
+            'нетворкинг', 'networking', 'saas', 'b2b', 'b2c', 'технологии для бизнеса',
+            'бизнес-конференция', 'бизнес-митап', 'entrepreneurship', 'конференция', 'conference',
+            'митап', 'meetup', 'workshop', 'воркшоп', 'семинар', 'seminar',
+            'инвестор', 'investor', 'раунд', 'round', 'фонд', 'fund',
         ]
-        
-        # Negative keywords (not relevant)
+
         negative_keywords = [
             'дизайн', 'design', 'ui/ux', 'графический дизайн', 'иллюстрация',
             'фотография', 'photography', 'искусство', 'art', 'творчество',
-            'хобби', 'hobby', 'личное развитие', 'йога', 'медитация'
+            'хобби', 'hobby', 'личное развитие', 'йога', 'медитация',
+            'госзакупки', 'тендер', 'медицина', 'hr-конференция',
         ]
-        
-        # Count matches
-        positive_count = sum(1 for keyword in positive_keywords if keyword in text_lower)
-        negative_count = sum(1 for keyword in negative_keywords if keyword in text_lower)
-        
-        # Calculate confidence
+
+        positive_count = sum(1 for kw in positive_keywords if kw in text_lower)
+        negative_count = sum(1 for kw in negative_keywords if kw in text_lower)
+
+        logger.debug(f"Keyword classification: positive={positive_count}, negative={negative_count}")
+
         total_keywords = positive_count + negative_count
         if total_keywords == 0:
-            return False, 0.3  # Low confidence if no keywords found
-        
-        confidence = positive_count / total_keywords if total_keywords > 0 else 0.5
+            if any(w in text_lower for w in ['event', 'событие', 'конференция', 'conference', 'meetup', 'митап']):
+                return True, 0.4
+            return False, 0.3
+
+        confidence = positive_count / total_keywords
+        if positive_count > 1:
+            confidence = min(0.9, confidence + 0.1 * (positive_count - 1))
+
         is_relevant = positive_count > negative_count and positive_count > 0
-        
         return is_relevant, confidence
 
+    def _extract_json(self, raw_text: str) -> Optional[str]:
+        """Extract JSON object from LLM response."""
+        try:
+            if not raw_text:
+                return None
+
+            if "```" in raw_text:
+                parts = raw_text.split("```")
+                for part in parts:
+                    part = part.strip()
+                    if part.startswith("{") and part.endswith("}"):
+                        return part
+
+            if raw_text.startswith("{") and raw_text.endswith("}"):
+                return raw_text
+
+            match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+            if match:
+                return match.group(0)
+        except Exception as e:
+            logger.debug(f"Error extracting JSON: {e}")
+        return None

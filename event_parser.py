@@ -6,6 +6,7 @@ import json
 import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any, Iterable
+from urllib.parse import urljoin, quote_plus
 from config import EVENT_KEYWORDS, CLASSIFIER_CONFIDENCE_THRESHOLD
 from event_classifier import EventClassifier
 
@@ -219,12 +220,17 @@ class EventParser:
                         event_date = dateparser.parse(start_date, languages=['ru', 'en'])
                     
                     if title and event_date:
+                        candidate_url = item.get('url') or source_url
+                        # Handle relative URLs
+                        if candidate_url and not candidate_url.startswith('http'):
+                            candidate_url = urljoin(source_url, candidate_url)
+
                         candidate = {
                             'title': title.strip(),
                             'description': description.strip()[:500],
                             'event_date': event_date,
                             'location': location.strip(),
-                            'url': item.get('url') or source_url
+                            'url': candidate_url
                         }
                         self._evaluate_candidate(candidate, events)
             except json.JSONDecodeError:
@@ -254,37 +260,57 @@ class EventParser:
     
     def _extract_event_from_element(self, element, source_url: str) -> Optional[Dict]:
         title = None
+        title_elem = None
         for tag in ['h1', 'h2', 'h3', 'a']:
             elem = element.find(tag)
             if elem and elem.get_text().strip():
                 title = elem.get_text().strip()
+                title_elem = elem
                 break
-        
+
         if not title:
             return None
-        
+
         description = ''
         paragraphs = element.find_all('p')
         if paragraphs:
             description = ' '.join(p.get_text().strip() for p in paragraphs[:3])[:500]
         else:
             description = element.get_text().strip()[:500]
-        
+
         date_text = element.get_text(separator=' ')
         event_date = self._extract_date_from_text(date_text)
         if not event_date:
             return None
-        
+
         location = None
         location_elem = element.find(string=re.compile(r'(?:Место|Location|Venue)', re.IGNORECASE))
         if location_elem:
             location = location_elem.parent.get_text().split(':', 1)[-1].strip()
-        
+
+        # Try to find direct link to event
         url = source_url
+
+        # First, look for link within the element
         link = element.find('a', href=True)
-        if link and link['href'].startswith('http'):
-            url = link['href']
-        
+        if link and link['href']:
+            href = link['href']
+            if href.startswith('http'):
+                url = href
+            elif href.startswith('/'):
+                # Relative URL - construct full URL
+                from urllib.parse import urljoin
+                url = urljoin(source_url, href)
+            elif href.startswith('#'):
+                # Anchor link - append to source URL
+                url = source_url + href
+
+        # For it-event-hub.ru, try to generate a search/filter URL
+        if 'it-event-hub.ru' in source_url and url == source_url:
+            # Escape title for URL
+            encoded_title = quote_plus(title[:30])
+            url = f"{source_url}?search={encoded_title}"
+
         return {
             'title': title,
             'description': description,

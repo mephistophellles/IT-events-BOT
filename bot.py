@@ -159,7 +159,7 @@ async def event_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message += f"\n📝 Описание:\n{event.description[:300]}...\n"
 
         if event.url:
-            message += f"\n🔗 Подробнее: {event.url}\n"
+            message += f"\n🔗 {event.url}\n"
 
         keyboard = []
         if not existing:
@@ -172,6 +172,10 @@ async def event_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "❌ Отменить регистрацию",
                 callback_data=f"unregister_{event_id}"
             )])
+
+        # Add direct link button
+        if event.url:
+            keyboard.append([InlineKeyboardButton("🔗 На сайт события", url=event.url)])
 
         keyboard.append([InlineKeyboardButton("🔙 Назад к списку", callback_data="back_events")])
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -518,12 +522,17 @@ async def send_event_notification(bot, event):
         message += f"\n📝 {event.description[:200]}...\n"
 
     if event.url:
-        message += f"\n🔗 Подробнее: {event.url}\n"
+        message += f"\n🔗 {event.url}\n"
 
-    keyboard = [[InlineKeyboardButton(
-        "📌 Подробнее и регистрация",
-        callback_data=f"event_{event.id}"
-    )]]
+    # Create two buttons: one for bot details, one for direct link
+    keyboard = [
+        [InlineKeyboardButton("📌 Подробнее", callback_data=f"event_{event.id}")],
+    ]
+
+    # Add direct link button if available
+    if event.url:
+        keyboard.append([InlineKeyboardButton("🔗 На сайт события", url=event.url)])
+
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     for user in users:

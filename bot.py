@@ -156,7 +156,9 @@ async def event_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message += f"📍 Место: {event.location}\n"
 
         if event.description:
-            message += f"\n📝 Описание:\n{event.description[:300]}...\n"
+            desc = event.description[:500]
+            suffix = "..." if len(event.description) > 500 else ""
+            message += f"\n📝 Описание:\n{desc}{suffix}\n"
 
         if event.url:
             message += f"\n🔗 {event.url}\n"
@@ -519,7 +521,9 @@ async def send_event_notification(bot, event):
         message += f"📍 {event.location}\n"
 
     if event.description:
-        message += f"\n📝 {event.description[:200]}...\n"
+        desc = event.description[:400]
+        suffix = "..." if len(event.description) > 400 else ""
+        message += f"\n📝 {desc}{suffix}\n"
 
     if event.url:
         message += f"\n🔗 {event.url}\n"

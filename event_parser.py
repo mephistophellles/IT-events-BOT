@@ -274,7 +274,12 @@ class EventParser:
         description = ''
         paragraphs = element.find_all('p')
         if paragraphs:
-            description = ' '.join(p.get_text().strip() for p in paragraphs[:3])[:500]
+            # Extract only the first valid paragraph (not empty, not too short)
+            for p in paragraphs:
+                text = p.get_text().strip()
+                if text and len(text) > 10:
+                    description = text[:500]
+                    break
         else:
             description = element.get_text().strip()[:500]
 
@@ -310,6 +315,11 @@ class EventParser:
             # Escape title for URL
             encoded_title = quote_plus(title[:30])
             url = f"{source_url}?search={encoded_title}"
+
+        # For leader-id.ru, generate anchor URL
+        if 'leader-id.ru' in source_url and url == source_url:
+            slug = title.lower().replace(' ', '-')[:50]
+            url = f"https://leader-id.ru/#{slug}"
 
         return {
             'title': title,
